@@ -13,10 +13,11 @@ interface Task {
   type: string
   key: string
   state: TaskState
-  mode: 'restartable' | 'atomic'
+  mode: TaskDefinition<unknown, unknown>['mode']
   resources: ResourceDemand
   demands: Map<symbol, Demand>
   priority: number
+  priorityListeners: Set<(priority: number) => void>
   order: 'fifo' | 'lifo'
   score: number
   createdAt: number
@@ -92,7 +93,8 @@ export class TaskScheduler {
     const close = (): Promise<void> => {
       if (closing) return closing
       closed = true
-      const active = [...entries.values()].map(entry => entry.task)
+      // 同 key 的新世代可能已经覆盖 entries，旧世代仍须等执行退出。
+      const active = [...this.tasks.values()].filter(task => task.type === definition.name)
       for (const task of active) this.cancel(task, new TaskInterrupted('unregister'))
       closing = Promise.all(active.map(task => task.execution)).then(() => {
         if (this.registrations.get(definition.name) === close) this.registrations.delete(definition.name)
@@ -109,17 +111,17 @@ export class TaskScheduler {
         const key = definition.key(input)
         if (!key) throw new Error('Task identity must be nonempty')
         const existing = entries.get(key)
-        if (existing) {
-          if (existing.task.stop && !['preempt', 'pause'].includes(existing.task.stop.kind)) {
-            throw new Error('Previous task execution is still stopping')
-          }
-          return existing.subscribe(options)
-        }
+        const predecessor = existing?.task.stop && !['preempt', 'pause'].includes(existing.task.stop.kind)
+          ? existing.task : undefined
+        if (existing && !predecessor) return existing.subscribe(options)
         const demand = Object.create(null) as Record<string, number>
         for (const [resource, amount] of Object.entries(definition.resources(input))) {
           positive(amount, `demand ${resource}`)
           if (this.limits[resource] === undefined || amount > this.limits[resource]!) throw new Error(`Unavailable resource: ${resource}`)
           demand[resource] = amount
+        }
+        if (definition.mode === 'orchestrator' && Object.keys(demand).length) {
+          throw new Error('Orchestrators cannot reserve execution resources')
         }
         this.makeRoom(options.priority)
         const successes = new Map<symbol, (value: O) => void>()
@@ -128,17 +130,27 @@ export class TaskScheduler {
         const task: Task = {
           id: ++this.nextId, type: definition.name, key, state: 'queued', mode: definition.mode,
           resources: Object.freeze(demand), demands: new Map(), priority: options.priority,
+          priorityListeners: new Set(),
           order: options.order ?? 'fifo', score: options.priority - now / this.agingMs,
           createdAt: Date.now(), queuedAt: now, waitedMs: 0, dispatchWeight: options.priority,
           startedAt: 0, attempt: 0, timeoutMs: definition.timeoutMs,
           execute: async (signal, assertCurrent) => {
-            const value = await definition.execute(input, {
-              signal, attempt: task.attempt, checkpoint,
-              saveCheckpoint: value => { assertCurrent(); checkpoint = value }, assertCurrent,
-            })
-            return () => { for (const resolve of successes.values()) resolve(value) }
+            try {
+              const value = await definition.execute(input, {
+                signal, attempt: task.attempt, checkpoint,
+                get priority() { return task.priority },
+                onPriorityChange: listener => {
+                  assertCurrent()
+                  listener(task.priority)
+                  task.priorityListeners.add(listener)
+                  return () => { task.priorityListeners.delete(listener) }
+                },
+                saveCheckpoint: value => { assertCurrent(); checkpoint = value }, assertCurrent,
+              })
+              return () => { for (const resolve of successes.values()) resolve(value) }
+            } finally { task.priorityListeners.clear() }
           },
-          remove: () => { entries.delete(key); successes.clear() },
+          remove: () => { if (entries.get(key)?.task === task) entries.delete(key); successes.clear() },
         }
         const subscribe = (request: DemandOptions): TaskLease<O> => {
           priorityValue(request.priority)
@@ -192,6 +204,14 @@ export class TaskScheduler {
       task.score = task.priority + Math.floor((task.waitedMs + performance.now() - task.queuedAt) / this.agingMs)
       this.pending.upsert(task)
     } else task.dispatchWeight += task.priority - previous
+    if (task.priority !== previous) {
+      for (const listener of task.priorityListeners) {
+        try { listener(task.priority) } catch (error) {
+          this.cancel(task, new TaskInterrupted('cancel', `Priority propagation failed: ${errorOf(error).message}`))
+          break
+        }
+      }
+    }
   }
 
   private makeRoom(priority: number): void {
@@ -205,8 +225,15 @@ export class TaskScheduler {
     this.cancel(worst, new TaskInterrupted('cancel', 'Evicted by higher priority demand'))
   }
 
+  private executionCount(released: readonly Task[] = []): number {
+    return [...this.running].filter(task => task.mode !== 'orchestrator' && !released.includes(task)).length
+  }
+
   private fits(task: Task, released: readonly Task[] = []): boolean {
-    if (this.running.size - released.length >= this.concurrency) return false
+    // 取消后的重订阅会创建新世代；无论其间撤销过几次，都要等同键旧执行真正退出。
+    if ([...this.running].some(previous => previous.type === task.type && previous.key === task.key)) return false
+    if (task.mode === 'orchestrator') return true
+    if (this.executionCount(released) >= this.concurrency) return false
     return Object.entries(task.resources).every(([resource, amount]) => {
       const freed = released.reduce((sum, victim) => sum + (victim.resources[resource] ?? 0), 0)
       return (this.used[resource] ?? 0) - freed + amount <= this.limits[resource]!
@@ -234,11 +261,11 @@ export class TaskScheduler {
       const now = performance.now(), weight = first.score
       const victims: Task[] = []
       // 已请求停止的执行仍占额度，但可以算进即将释放的容量，避免反复中断更多任务。
-      const candidates = [...this.running].filter(task => task.state === 'stopping'
-        || (task.mode === 'restartable' && now - task.startedAt >= this.quantumMs && task.dispatchWeight < weight))
+      const candidates = [...this.running].filter(task => task.mode !== 'orchestrator' && (task.state === 'stopping'
+        || (task.mode === 'restartable' && now - task.startedAt >= this.quantumMs && task.dispatchWeight < weight)))
         .sort((a, b) => Number(b.state === 'stopping') - Number(a.state === 'stopping') || a.dispatchWeight - b.dispatchWeight)
       for (const task of candidates) {
-        const conflicts = this.running.size - victims.length >= this.concurrency
+        const conflicts = this.executionCount(victims) >= this.concurrency
           || Object.keys(first.resources).some(resource => (task.resources[resource] ?? 0) > 0)
         if (conflicts) victims.push(task)
         if (this.fits(first, victims)) break
@@ -339,7 +366,7 @@ export class TaskScheduler {
   pause(): void {
     this.paused = true
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined }
-    for (const task of this.running) if (task.mode === 'restartable') this.interrupt(task, new TaskInterrupted('pause'))
+    for (const task of this.running) if (task.mode !== 'atomic') this.interrupt(task, new TaskInterrupted('pause'))
   }
   resume(): void {
     if (this.closed) throw new Error('Scheduler is closed')

@@ -12,6 +12,11 @@ export class TaskInterrupted extends Error {
 export interface Execution<C> {
   readonly signal: AbortSignal
   readonly attempt: number
+  /** 当前共享需求的最高优先级；执行期间也可能随租约改变。 */
+  readonly priority: number
+  /** 同步交付当前值及后续变化，用于把优先级传给所等待的独立子任务。
+   * 回调只更新需求，不能执行重负载；本次执行结束时自动解绑。 */
+  onPriorityChange(listener: (priority: number) => void): () => void
   readonly checkpoint: C | undefined
   /** 仅保存已经完成的阶段；恢复时由执行器解释，不克隆资源句柄。 */
   saveCheckpoint(value: C): void
@@ -23,8 +28,10 @@ export interface TaskDefinition<I, O, C = never> {
   readonly name: string
   key(input: I): string
   resources(input: I): ResourceDemand
-  /** restartable 必须响应 signal 并等待实际退出；atomic 只在边界结束。 */
-  readonly mode: 'restartable' | 'atomic'
+  /** restartable 必须响应 signal 并等待实际退出；atomic 只在边界结束。
+   * orchestrator 只编排独立子任务，resources 必须为空，不占执行并发。
+   * 编排器不能直接运行重负载，否则调度器无法约束其资源。 */
+  readonly mode: 'restartable' | 'atomic' | 'orchestrator'
   execute(input: I, execution: Execution<C>): Promise<O>
   readonly timeoutMs?: number
 }
@@ -64,7 +71,7 @@ export interface TaskSnapshot {
   type: string
   key: string
   state: TaskState
-  mode: 'restartable' | 'atomic'
+  mode: TaskDefinition<unknown, unknown>['mode']
   priority: number
   demandCount: number
   resources: ResourceDemand

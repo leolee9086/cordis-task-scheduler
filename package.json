@@ -1,6 +1,6 @@
 {
   "name": "@leolee9086/cordis-task-scheduler",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Resource-aware preemptive task scheduling with shared demand and Cordis lifecycle ownership",
   "type": "module",
   "license": "AGPL-3.0-or-later",

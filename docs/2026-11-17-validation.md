@@ -1,4 +1,14 @@
-# 2026-11-17 首个调度器版本验证
+# 2026-11-17 调度器版本验证
+
+## alpha.2 应用接线前补充（07:35）
+
+位置：本独立仓库。意图：解决颜色编排等待图片子任务时的并发死锁、运行时提权传播，以及视口快速离开再返回的同键重订阅竞态。
+
+新增 orchestrator 模式（空资源、不占执行并发、仍占有界任务容量），Execution.priority/onPriorityChange；同键旧执行取消后新世代排队等待其实际退出，注销也等待旧世代。没有改动参考仓库。
+
+pnpm typecheck/build（pwsh-848ae960036d4c75）exit0。真实 JPEG 的 SHA256 工作负载（pwsh-15eee50ef05f4cd3）exit0：总并发1，orchestrator 调用 Worker 子任务正常完成；父租约动态升到80后子任务实际priority=80；与独立readFile哈希一致。撤销正在运行的同键Worker并立即重订阅，旧任务cancelled事件18先于新任务started事件19，新结果哈希一致，tasks=0、used.cpu=0。没有新增验证脚本或虚构数据。此结果只验证调度，不证明FileBrowser颜色/图像生产接线。
+
+以下为 alpha.1 历史记录。
 
 时间：2026-11-17 清晨。位置：D:/dev/cordis-task-scheduler。意图：将 SACAssetsManager、textureBackerDemo 队列及 s-forge 中断机制归纳为独立可安装的 Cordis 调度插件，验证执行端停止、共享需求和检查点恢复。
 
