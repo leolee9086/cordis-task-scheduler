@@ -1,0 +1,20 @@
+{
+  "name": "@leolee9086/cordis-task-scheduler",
+  "version": "0.1.0-alpha.1",
+  "description": "Resource-aware preemptive task scheduling with shared demand and Cordis lifecycle ownership",
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "repository": { "type": "git", "url": "https://github.com/leolee9086/cordis-task-scheduler.git" },
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./plugin": { "types": "./dist/plugin.d.ts", "import": "./dist/plugin.js" },
+    "./worker": { "types": "./dist/worker.d.ts", "import": "./dist/worker.js" }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc"
+  },
+  "peerDependencies": { "@deepseek-ai/cordis": "^4.0.5" },
+  "devDependencies": { "@deepseek-ai/cordis": "4.0.5", "@types/node": "^22.0.0", "typescript": "^5.6.0" }
+}
