@@ -38,6 +38,8 @@ CPU 密集任务可以使用 `@leolee9086/cordis-task-scheduler/worker` 的 Work
 
 最后一个需求撤销后，旧执行可能仍在 stopping。同键新需求进入新世代并排队，必须等旧执行实际退出才启动；旧世代清理不会删掉新世代。插件注销会同时等待这些旧执行。
 
+原生模块可以使用 `@leolee9086/cordis-task-scheduler/process` 的 ChildProcessExecutor。工厂返回带 IPC 的独立子进程，输入和唯一最终响应通过 IPC 传递；二进制建议使用 `serialization: "advanced"`。执行器取消时发送 SIGKILL，并等待 `close` 才结束执行，不能把 kill 的返回值当作退出证据。工厂不得创建无人管理的孙进程；本执行器只拥有直接工作进程。它没有内部队列，必须先领取调度资源。不能停止的执行端继续保持 stopping 和额度，不用超时伪造释放。
+
 检查点用于同一任务被抢占后的恢复。长时间不响应 AbortSignal 的原子调用无法由 JavaScript 强行中断；需要强制中断时必须放进 Worker 或独立进程。
 
 首个预发布版本已通过严格类型检查、构建，以及真实 JPEG/PNG 的 Worker 抢占重启、共享任务、单租约撤销、文件读取检查点恢复和 Cordis 卸载验证。尚未接入 FileBrowser；应用可见任务插队、颜色索引、公平性持续负载和所有任务入口迁移仍待验收。详细事实见仓库 `docs/2026-11-17-validation.md`。

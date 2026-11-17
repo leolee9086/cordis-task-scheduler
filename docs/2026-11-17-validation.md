@@ -1,5 +1,11 @@
 # 2026-11-17 调度器版本验证
 
+## alpha.3 原生执行端（约10:00）
+
+位置：独立库。意图：Sharp/libvips 等原生负载需要进程隔离，不能只取消外层 Promise。新增 `/process` ChildProcessExecutor，无内部排队，IPC 单请求单最终响应，取消发 SIGKILL 并等 close，进程退出前继续占调度额度；仅管理直接工作进程，不承诺孙进程树。
+
+首次类型检查 pwsh-c54ce1359de24dc8 exit2：泛型输入未约束 Serializable，已补上契约。pwsh-b8c4d21535d1405a typecheck/build及真实原生抢占验证 exit0：使用安装资产 DTS_HPX_cmyk_4C_rev.jpg，子进程 Sharp 实际开始解码后提交前台80，后台-50被抢占。观察 interrupt→process-close PID8584→resumed→前台started/succeeded→后台attempt2 succeeded；收尾工作进程18580关闭，tasks0/used.cpu0。两次完整RGBA输出2005248字节，SHA256 4f14a93e4c6c560386a1dc3cfe409da2535ddf1dd19c0dce78c006077486f024，与主进程独立Sharp解码一致。该证据验证执行中断/恢复与结果完整性，不是独立色彩精度验证，也不代表FileBrowser前台已接通。
+
 ## alpha.2 应用接线前补充（07:35）
 
 位置：本独立仓库。意图：解决颜色编排等待图片子任务时的并发死锁、运行时提权传播，以及视口快速离开再返回的同键重订阅竞态。
