@@ -1,45 +1,132 @@
 # Cordis Task Scheduler
 
-TypeScript 任务调度核心与 Cordis 插件。统一交互、可见资源、预取及后台任务的身份、需求、资源分派和中断生命周期。包名 `@leolee9086/cordis-task-scheduler`，计划发布到 https://github.com/leolee9086/cordis-task-scheduler 。
+TypeScript 任务调度器，提供多环分派、共享需求、资源额度、协作式抢占、lane 串行隔离、阶段屏障和可选 SQLite 持久队列。核心可以单独使用，也可以通过 Cordis 插件管理生命周期。
 
-## 调度契约
+## 安装与入口
 
-任务类型由插件注册，声明输入类型、输出类型、身份键、资源需求与执行函数。同一注册实例的相同身份键共享一项工作；每个调用者持有独立需求租约，取消只撤销自己的需求。最后一个租约释放才取消工作，优先级取活跃需求的最高值。身份键必须包含会改变输出的资源版本与参数，调度器不推测路径身份。
+```sh
+pnpm add https://github.com/leolee9086/cordis-task-scheduler/releases/download/v0.1.0-alpha.4/cordis-task-scheduler-0.1.0-alpha.4.tgz
+```
 
-优先级数值越大越优先，同级默认 FIFO；后台可显式选 LIFO。等待时间持续增加调度权重，已获得公平性提升的任务在本次执行中保留该权重，避免刚启动就被再次抢占。队列容量有界；只有可驱逐的等待任务才能被更高优先级的新任务替换，运行任务不因容量不足被暗中删除。
+| 入口 | 用途 |
+| --- | --- |
+| `@leolee9086/cordis-task-scheduler` | `TaskScheduler`、任务契约与错误类型 |
+| `@leolee9086/cordis-task-scheduler/plugin` | Cordis `taskScheduler` 服务、`tasks:changed` 与 `tasks:gap` 事件 |
+| `@leolee9086/cordis-task-scheduler/worker` | Node Worker 执行器 |
+| `@leolee9086/cordis-task-scheduler/process` | Node IPC 子进程执行器 |
+| `@leolee9086/cordis-task-scheduler/sqlite` | `SqliteTaskStore` 持久收件箱 |
 
-每次执行领取一组资源额度，整体原子分配；释放只发生在执行 Promise 真正结束之后。中断发出 AbortSignal 并进入 stopping 状态；它不等于完成。执行器必须等待原生资源停止、Worker terminate 或进程退出，才能结束 Promise。不能中断的原子阶段必须显式声明为 atomic，调度器等待其完成，观测信息保留实际模式。
+Cordis 插件需要 `@deepseek-ai/cordis` 4.0.5 或兼容版本。SQLite 入口接收调用方创建的 `node:sqlite` `DatabaseSync`；核心入口不加载 SQLite。真实文件验证环境为 Node 22.19.0。
 
-可恢复任务调用 checkpoint 保存应用自有状态。抢占后重新排队，下一次执行取得最新检查点。检查点不自动回滚磁盘或网络副作用；任务通过 assertCurrent 在提交前核验执行代次，并使用业务自身的事务/世代检查提交。不可重入副作用应使用 atomic 模式。
+## 从一个真实文件任务开始
 
-取消、超时、抢占、卸载是不同原因。超时会中断执行，但在执行端退出前继续持有额度，避免把仍占资源的任务从计数中抹去。插件注销取消其全部任务并等待实际清理。事件与有界历史可观测等待、启动、中断请求、恢复、完成和失败。
+```ts
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { TaskScheduler } from '@leolee9086/cordis-task-scheduler'
 
-## 参考与取舍
+const scheduler = new TaskScheduler({
+  resources: { disk: 1 }, concurrency: 2, capacity: 256,
+  defaultRing: 'background', quantumMs: 100,
+  rings: [
+    { name: 'interactive', rank: 0, preempts: ['background'] },
+    { name: 'background', rank: 1, maxBypass: 8 },
+  ],
+})
+const digests = scheduler.register<{ path: string; revision: string }, string>({
+  name: 'file.sha256', mode: 'restartable',
+  key: input => JSON.stringify([input.path, input.revision]),
+  resources: () => ({ disk: 1 }),
+  execute: async (input, execution) => {
+    const hash = createHash('sha256')
+    for await (const chunk of createReadStream(input.path, { signal: execution.signal })) {
+      hash.update(chunk)
+    }
+    execution.assertCurrent()
+    return hash.digest('hex')
+  },
+})
 
-- SACAssetsManager `source/server/processors/queue/taskQueue.js`：吸收前台与后台分级、后台 LIFO、堆式优先选择；其全局 pause 不会中断正在 await 的任务。前台请求直接改全局布尔值会互相覆盖，改由独立租约表达需求。
-- SACAssetsManager `src/toolBox/base/useAsync/forTaskQueue/forSerialTaskQueue.js`：吸收显式暂停/恢复与容量边界；idle callback 只能决定何时开始，不能代表执行端暂停。
-- textureBackerDemo `packages/my-async-queue/src/index.ts`：吸收任务状态机、公开结果与内部执行结算分离、并发/容量控制。其 running cancel 只拒绝公开 Promise，载荷仍继续；本库保留执行占用直到确认退出。
-- 同库 `transaction.ts`：队列内存快照不能撤销已发生的外部副作用，也不能回滚执行中的 Promise；本库使用检查点与业务事务，不提供误导性的队列事务回滚。
-- s-forge `packages/agentqueue/ring.go` 与 `kernel/api/magi_priority_queue.go`：吸收投递语义与优先级分离、同级 FIFO、关闭后禁止入队。真实消费者 `kernel/api/magi.go` 的 submitMagiTaskWithReplyStream 先调用 InterruptHeartbeat 再入前台队列；`kernel/api/magi_runtime.go` 会 cancel 活跃心跳并等待 done，最多等待 1500ms。统一分发器仍等 CoordinateHeartbeat 返回才取下一项，不能把这个等待超时当作执行完成。本库将中断原因、执行退出回执与重新排队放入统一状态机。
+const path = process.argv[2]
+if (!path) throw new Error('请传入一个已有文件路径')
+const info = await stat(path)
+const source = { path, revision: JSON.stringify([info.size, info.mtimeMs]) }
+// 示例使用 stat 版本；生产存储摘要前仍需再次核对资源身份和版本。
+const lease = digests.submit(source, { ring: 'interactive', priority: 50 })
+try { console.log(await lease.result) }
+finally { lease.release(); await scheduler.close() }
+```
 
-参考项目暂不做消费者改造；新库实现并发布后，在原队列入口添加迁移注释，要求后续切换到本库。参考项目原有协议不被直接冒充为兼容 API。
+## 环、需求与准入
 
-## 开发与交付
+环间先比较 `rank`，数值越小越先分派；同 rank 的就绪环轮转。每个环分别配置 `order: 'priority' | 'fifo' | 'lifo'`、容量 `capacity`、并发 `concurrency`、资源上限 `resources` 与老化周期 `agingMs`。未提供 `rings` 时使用一个名为 `default` 的环。
 
-使用 pnpm、严格 TypeScript；不引入 any，不运行 mock 或生造数据测试。仅做类型检查、构建及真实文件/应用负载验证。消费者只允许 registry 或 GitHub 固定版本依赖，禁止 file:、link: 及 workspace: 跨仓库依赖。
+环内 `priority` 范围为 -100 到 100。默认按优先级加等待老化排序，相同权重按请求的 FIFO/LIFO 次序处理。`preempts` 明确允许中断哪些其他环；`preemptWithin` 控制同环优先级抢占。普通抢占至少等待本次执行达到 `quantumMs`。
 
-## 使用边界
+`maxBypass` 是等待环可以让过的其他分派次数预算。到期后优先获得一次服务机会，也可抢占其他环的可恢复任务。公平执行有保护窗口，至少一个 quantum；没有检查点的任务反复重启时，窗口随累计重启成本增长。这个策略帮助有限任务取得连续服务，也可能增加前台等待。原子任务或不响应中断的执行器仍会阻塞资源，因此这里没有墙钟延迟上界。
 
-从主入口导入 TaskScheduler，或将 `@leolee9086/cordis-task-scheduler/plugin` 挂到 Cordis。配置必须给出资源额度，例如 cpu、disk、network；名称由应用决定。任务通过 register 注册后，由返回队列的 submit 获取租约。租约 result 返回结果，setPriority 更新自己的需求优先级，release 撤销自己的需求。
+同一注册队列的同 key 工作共享执行，每次 `submit` 得到独立租约：
 
-CPU 密集任务可以使用 `@leolee9086/cordis-task-scheduler/worker` 的 WorkerExecutor。构造器接收 Worker 工厂与响应校验函数。Worker 必须每个输入只发一个最终响应；进度消息须由另一个协议通道处理。执行器不维护内部任务队列，调用方先通过调度器领取额度。
+- `result` 保留成功或拒绝结果；取得租约后立即接入 await/then/catch，主动释放也会拒绝，不能弃置结果。
+- `setDemand({ ring, priority })` 更新这一份需求。
+- `release(reason?)` 撤销这一份需求；最后一份撤销才取消工作。
 
-任务 execute 不得在持有额度时再等待领取同一组额度的子任务，否则会形成资源死锁。分阶段工作使用 `mode: 'orchestrator'`、`resources: () => ({})`：编排器占队列容量但不占执行并发，实际重负载交给独立子任务。通过 `execution.priority` 和 `execution.onPriorityChange` 将共享需求的最新优先级传给子租约；子租约同时绑定 `execution.signal`。本次执行结束会清理优先级订阅；调用方也可主动解绑。编排器不能直接运行重负载，也不能递归等待自身身份的任务。
+有效需求取静态环级顺序最强的一份，再比较环内优先级。同 key 的 lane、segment 和资源向量必须一致；影响工作内容的版本和参数应进入 key。结果不会在核心中缓存。
 
-最后一个需求撤销后，旧执行可能仍在 stopping。同键新需求进入新世代并排队，必须等旧执行实际退出才启动；旧世代清理不会删掉新世代。插件注销会同时等待这些旧执行。
+`submitBatch(requests, expectedVersion?)` 先验证并预留容量，再发布整批。`capacityBehavior` 可设为 `evict`、`reject` 或 `throw`：evict 只驱逐有效需求较弱、全部租约均允许 `evictable` 的等待工作；reject 返回整批拒绝租约；throw 同步抛出容量错误。其他验证错误均同步抛出。容量按首次准入环计费，需求提权不会改变积压归属。`queue.version` 与 `cancelPending(id, expectedVersion)` 提供等待任务的乐观并发检查。
 
-原生模块可以使用 `@leolee9086/cordis-task-scheduler/process` 的 ChildProcessExecutor。工厂返回带 IPC 的独立子进程，输入和唯一最终响应通过 IPC 传递；二进制建议使用 `serialization: "advanced"`。执行器取消时发送 SIGKILL，并等待 `close` 才结束执行，不能把 kill 的返回值当作退出证据。工厂不得创建无人管理的孙进程；本执行器只拥有直接工作进程。它没有内部队列，必须先领取调度资源。不能停止的执行端继续保持 stopping 和额度，不用超时伪造释放。
+## 执行、中断与依赖
 
-检查点用于同一任务被抢占后的恢复。长时间不响应 AbortSignal 的原子调用无法由 JavaScript 强行中断；需要强制中断时必须放进 Worker 或独立进程。
+资源向量整体分配，执行 Promise 真正退出后归还额度。`execution.signal` 通知抢占、取消、暂停或关闭，执行器必须等待自己持有的资源停止。
 
-首个预发布版本已通过严格类型检查、构建，以及真实 JPEG/PNG 的 Worker 抢占重启、共享任务、单租约撤销、文件读取检查点恢复和 Cordis 卸载验证。尚未接入 FileBrowser；应用可见任务插队、颜色索引、公平性持续负载和所有任务入口迁移仍待验收。详细事实见仓库 `docs/2026-11-17-validation.md`。
+| 模式 | 契约 |
+| --- | --- |
+| `restartable` | 响应中断并清理；抢占或暂停后从头或检查点重试 |
+| `atomic` | 普通抢占和暂停不打断执行；取消仍通知 signal，额度保持到退出 |
+| `orchestrator` | 只编排工作，资源必须为空，不占执行并发，但占任务容量 |
+
+`lane(input)` 定义跨任务类型互斥的串行域。`segment(input)` 定义本注册队列的非负整数阶段；前一阶段全部实际退出，后面阶段才开始。开始过的阶段不能再插入更早阶段；失败或取消也算该项已退出，若要求“前段成功才执行”，由编排器处理业务失败。
+
+编排器使用 `execution.submitChild(queue, input)` 等待同一调度器的子任务。子需求继承当前及后续需求变化，父执行结束自动释放；依赖环、祖先 lane 和祖先阶段造成的等待会被拒绝。持有执行资源的普通任务不能使用此入口。
+
+跨服务传递需求时使用 `execution.demand` 和 `execution.onDemandChange(listener)`。监听器同步收到当前值，后续变化在整批准入完成后、下一次分派前合并交付。`saveCheckpoint(value)` 仅保存当前任务的内存进度。提交业务结果前调用 `assertCurrent()`，持久层还应检查业务版本与领取凭据。
+
+## SQLite 持久收件箱
+
+创建 `SqliteTaskStore({ database, namespace, codec })`；codec 必须提供明确的 `version`、同步 `encode(input)` 与 `decode(json)`，不推测旧字段。连接、journal、同步策略和关闭由调用方管理；队列拥有自己的 `scheduler_namespaces`、`scheduler_tasks` 表。
+
+| 操作 | 事务语义 |
+| --- | --- |
+| `submitBatch` | 全批入库或回滚；同 key 必须保持相同 payload 和 demand |
+| `updatePending` / `promote` / `cancelPending` | 按队列版本检查，修改等待工作并更新 revision |
+| `pending(limit)` | 按入队 sequence 枚举有限候选，不提前领取 |
+| `claim(candidates, owner)` | 检查每项 revision，整批领取并生成 token |
+| `settle(claim, outcome, commit?)` | 校验 owner/token/revision，同事务写业务结果与终态 |
+| `release(claim)` | 校验凭据后回到 pending，旧凭据失效 |
+| `recover(owner, policy)` | 调用方确认这个旧 owner 已退出后，明确选择 retry 或 fail |
+| `prune(retain)` | 清理已结算任务，保留活跃任务及业务结果表 |
+
+推荐在调度器执行器实际取得额度后 `claim`，执行真实工作，检查资源版本和当前执行，再以 `settle` 同事务提交结果。`version` 随成功变更增长；失败会回滚。已完成任务需要新的业务 key 才能代表新的工作。
+
+codec 必须是纯同步转换，不得重入队列、修改输入或访问数据库。settle 回调只能同步写当前连接的业务表，不得自行 BEGIN/COMMIT/ROLLBACK 或改写调度器表。队列操作不能嵌套在调用方已打开的事务里；需要原子业务写入时使用 settle 回调。回调不能执行不可回滚的外部副作用。
+
+恢复不会按心跳超时推断进程死亡，也不会自动重放未知副作用。数据库事务只覆盖同一连接中的写入；外部网络或文件操作的幂等性由业务实现。运行快照和事件历史不用于持久恢复。
+
+## 生命周期、执行器与观测
+
+`queue.close()` 同步停止接单并让出注册名，返回的 Promise 等待旧执行退出。新代可以立即注册，同 key/lane 执行仍等待旧代释放。资源和队列创建后应立即登记 Cordis 清理，确保初始化中途失败也能撤销贡献。
+
+`onIdle({ signal?, timeoutMs? })` 等待实际空闲。`drain()` 停止外部接单，让已有工作及其子任务完成；原来暂停的调度器仍保持暂停。`pause()` 中断可恢复工作，`resume()` 继续分派，`close()` 取消全部工作并等待退出。
+
+WorkerExecutor 取消时等待 `terminate()` 完成。ChildProcessExecutor 发送 SIGKILL 并等待 close；它只拥有直接子进程，工厂不能留下无人管理的孙进程。不可中断的原生调用持续占用额度，需要强制停止时应放进可终止的独立执行端。
+
+`subscribe({ event, gap })` 返回退订函数。事件与诊断共用有界历史，溢出通过 gap 明确报告缺失 sequence 范围；收到 gap 后按需用 `snapshot()` 重建视图。快照包含任务、资源用量、环状态、六类索引计数和历史。事件中的异常保留 stack、cause 与 AggregateError 子错误。
+
+## 从 alpha.3 更新
+
+移除 `execution.priority`、`onPriorityChange`、`lease.setPriority`，消费端统一使用完整 demand。订阅入口改为 `subscribe({ event, gap })`；队列 close 现在立即让出注册名。所有消费端应同步更新，不提供旧接口兼容层。
+
+## 许可
+
+AGPL-3.0-or-later。
